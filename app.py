@@ -10,6 +10,9 @@ import pymongo
 import spacy
 import time
 import psutil
+import nltk
+import subprocess
+import importlib.util
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from werkzeug.utils import secure_filename
 from io import BytesIO
@@ -17,6 +20,7 @@ from io import BytesIO
 # Initialize Flask app
 app = Flask(__name__)
 
+# Create uploads folder if not exists
 if not os.path.exists("uploads"):
     os.makedirs("uploads", exist_ok=True)
 
@@ -29,27 +33,29 @@ db = mongo_client['pdf_database']
 collection = db['pdf_metadata']
 
 # Download stopwords if not already downloaded
-import nltk
 nltk.download('stopwords')
-
-# Load English stop words
 stop_words = set(stopwords.words('english'))
 
-# Load the spaCy model
-nlp = spacy.load("en_core_web_sm")
+# Ensure spaCy model is installed
+model_name = "en_core_web_sm"
+if not importlib.util.find_spec(model_name):
+    subprocess.run(["python", "-m", "spacy", "download", model_name])
+nlp = spacy.load(model_name)
 
-# HTML Route
+# HTML upload page
 @app.route('/')
 def index():
     app.logger.info("Rendering upload.html")
-    return render_template('upload.html')  # Ensure this file exists in a 'templates' folder
+    return render_template('upload.html')  # Must exist in /templates
 
-# Upload Route
+# Upload file route
 @app.route('/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No file part'}), 400
+    return jsonify({'success': True, 'message': 'File(s) received.'}), 200
 
+# Main PDF parsing route
 @app.route('/parse', methods= ['POST'])
 def parse_pdf():
     files = request.files.getlist('file')
@@ -75,31 +81,35 @@ def parse_pdf():
 
 # Function to process each PDF file
 def process_pdf(file):
-    file_path = os.path.join("uploads", secure_filename(file.filename))  # Ensure the uploads directory exists
-    file.save(file_path)  # Save the uploaded file
+    try:
+        file_path = os.path.join("uploads", secure_filename(file.filename))
+        file.save(file_path)
 
-    start_time = time.time()
-    process = psutil.Process(os.getpid())
-    
-    title, authors, keywords, summary = parse_pdf_metadata_and_summarize(file_path)
-    time_taken = time.time() - start_time
-    memory_usage = process.memory_info().rss / (1024 * 1024)
-    
-    save_to_mongodb(file_path, title, authors, keywords, summary, time_taken, memory_usage)
-    
-    return {
-        "file_name": os.path.basename(file_path),
-        "title": title,
-        "author": authors,
-        "keywords": keywords,
-        "summary": summary,
-        "file_path": file_path,
-        "file_size": os.path.getsize(file_path),
-        "time_taken_sec": time_taken,
-        "memory_usage_mb": memory_usage
-    }
+        start_time = time.time()
+        process = psutil.Process(os.getpid())
+        
+        title, authors, keywords, summary = parse_pdf_metadata_and_summarize(file_path)
+        time_taken = time.time() - start_time
+        memory_usage = process.memory_info().rss / (1024 * 1024)
+        
+        save_to_mongodb(file_path, title, authors, keywords, summary, time_taken, memory_usage)
 
-# Function to extract title, author, keywords, and summary
+        return {
+            "file_name": os.path.basename(file_path),
+            "title": title,
+            "author": authors,
+            "keywords": keywords,
+            "summary": summary,
+            "file_path": file_path,
+            "file_size": os.path.getsize(file_path),
+            "time_taken_sec": round(time_taken, 2),
+            "memory_usage_mb": round(memory_usage, 2)
+        }
+    except Exception as e:
+        logging.error(f"Error processing PDF {file.filename}: {str(e)}")
+        return {"error": f"Failed to process {file.filename}", "details": str(e)}
+
+# Function to extract metadata and summary
 def parse_pdf_metadata_and_summarize(file_path):
     try:
         title = "Unknown Title"
@@ -118,9 +128,9 @@ def parse_pdf_metadata_and_summarize(file_path):
                     title_words = [word for word in first_page_text.split() if "(" not in word][:10]
                     title = ' '.join(title_words)
 
-                authors_matches = re.findall(r'\((.*?)\)', first_page_text)
-                if authors_matches:
-                    authors = ', '.join(authors_matches)
+                    authors_matches = re.findall(r'\((.*?)\)', first_page_text)
+                    if authors_matches:
+                        authors = ', '.join(authors_matches)
 
                 word_list = re.findall(r'\b\w+\b', text.lower())
                 filtered_words = [word for word in word_list if word not in stop_words]
@@ -135,7 +145,7 @@ def parse_pdf_metadata_and_summarize(file_path):
         logging.error(f"Error parsing PDF {file_path}: {e}")
         return "Unknown Title", "Unknown Author", [], "Error during summarization"
 
-# Function to summarize text
+# Simple frequency-based text summarization
 def summarize_text(doc, num_sentences=2):
     word_frequencies = {}
     for token in doc:
@@ -146,16 +156,13 @@ def summarize_text(doc, num_sentences=2):
     for sent in doc.sents:
         for word in sent:
             if word.text.lower() in word_frequencies:
-                if sent in sentence_scores:
-                    sentence_scores[sent] += word_frequencies[word.text.lower()]
-                else:
-                    sentence_scores[sent] = word_frequencies[word.text.lower()]
+                sentence_scores[sent] = sentence_scores.get(sent, 0) + word_frequencies[word.text.lower()]
 
     summarized_sentences = sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:num_sentences]
     summary = ' '.join([sent.text for sent in summarized_sentences])
     return summary
 
-# Save metadata to MongoDB
+# Save to MongoDB
 def save_to_mongodb(file_path, title, authors, keywords, summary, time_taken, memory_usage):
     document = {
         "file_name": os.path.basename(file_path),
@@ -165,12 +172,12 @@ def save_to_mongodb(file_path, title, authors, keywords, summary, time_taken, me
         "summary": summary,
         "file_path": file_path,
         "file_size": os.path.getsize(file_path),
-        "time_taken_sec": time_taken,
-        "memory_usage_mb": memory_usage
+        "time_taken_sec": round(time_taken, 2),
+        "memory_usage_mb": round(memory_usage, 2)
     }
     collection.insert_one(document)
 
-# Download metadata as JSON
+# Download metadata
 @app.route('/download/<file_name>', methods=['GET'])
 def download_metadata(file_name):
     document = collection.find_one({"file_name": file_name})
@@ -189,5 +196,6 @@ def download_metadata(file_name):
         mimetype='application/json'
     )
 
+# Run locally
 if __name__ == "__main__":
     app.run(debug=True)
